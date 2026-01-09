@@ -1,0 +1,13 @@
+# Scanner de Ports & Services Intelligent
+# Aucune dépendance externe requise - utilise uniquement les bibliothèques standard de Python
+
+# Python 3.6+ requis
+# Modules utilisés (inclus dans Python standard):
+# - socket
+# - threading
+# - argparse
+# - queue
+# - datetime
+# - time
+# - sys
+
