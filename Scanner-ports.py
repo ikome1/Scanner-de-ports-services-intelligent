@@ -9,61 +9,37 @@ import socket
 import threading
 import argparse
 import time
+import logging
 from queue import Queue
 from datetime import datetime
 from typing import List, Dict, Tuple
 import sys
+import os
 
-# Dictionnaire des ports et services communs
-SERVICES_COMMON = {
-    21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS',
-    80: 'HTTP', 110: 'POP3', 111: 'RPC', 135: 'MSRPC', 139: 'NetBIOS',
-    143: 'IMAP', 443: 'HTTPS', 445: 'SMB', 993: 'IMAPS', 995: 'POP3S',
-    1433: 'MSSQL', 3306: 'MySQL', 3389: 'RDP', 5432: 'PostgreSQL',
-    5900: 'VNC', 8080: 'HTTP-Proxy', 8443: 'HTTPS-Alt', 27017: 'MongoDB'
-}
+# Ajoute le répertoire parent au path pour les imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Ports sensibles avec niveaux de risque
-SENSITIVE_PORTS = {
-    # Très critique
-    22: {'service': 'SSH', 'risk': 'HIGH', 'description': 'Accès à distance - Utiliser des clés SSH, désactiver l\'authentification par mot de passe'},
-    23: {'service': 'Telnet', 'risk': 'CRITICAL', 'description': 'Protocole non chiffré - Remplacer par SSH'},
-    3389: {'service': 'RDP', 'risk': 'HIGH', 'description': 'Accès bureau à distance - Activer NLA, utiliser VPN'},
-    445: {'service': 'SMB', 'risk': 'HIGH', 'description': 'Partage de fichiers Windows - Vérifier les versions, désactiver SMBv1'},
-    139: {'service': 'NetBIOS', 'risk': 'MEDIUM', 'description': 'Service réseau Windows - Peut révéler des informations'},
-    135: {'service': 'MSRPC', 'risk': 'MEDIUM', 'description': 'RPC Microsoft - Peut être exploité'},
-    5900: {'service': 'VNC', 'risk': 'HIGH', 'description': 'Accès bureau distant - Non chiffré par défaut, utiliser SSH tunnel'},
-    
-    # Moyennement critique
-    21: {'service': 'FTP', 'risk': 'MEDIUM', 'description': 'Protocole non chiffré - Utiliser SFTP/FTPS'},
-    1433: {'service': 'MSSQL', 'risk': 'MEDIUM', 'description': 'Base de données - Restreindre l\'accès réseau'},
-    3306: {'service': 'MySQL', 'risk': 'MEDIUM', 'description': 'Base de données - Restreindre l\'accès réseau'},
-    5432: {'service': 'PostgreSQL', 'risk': 'MEDIUM', 'description': 'Base de données - Restreindre l\'accès réseau'},
-    27017: {'service': 'MongoDB', 'risk': 'MEDIUM', 'description': 'Base de données NoSQL - Vérifier l\'authentification'},
-    
-    # Informations
-    80: {'service': 'HTTP', 'risk': 'LOW', 'description': 'Serveur web - Rediriger vers HTTPS'},
-    443: {'service': 'HTTPS', 'risk': 'LOW', 'description': 'Serveur web sécurisé - Vérifier les certificats'},
-    25: {'service': 'SMTP', 'risk': 'LOW', 'description': 'Serveur de messagerie - Vérifier la configuration'},
-}
+from utils.colors import Colors
+from utils.logger import setup_logger, get_logger
+from utils.validators import validate_target, validate_port_range, ValidationError
+from config import SERVICES_COMMON, SENSITIVE_PORTS, SCANNER_CONFIG, LOGGING_CONFIG
 
-# Codes couleur ANSI
-class Colors:
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
-    CYAN = '\033[96m'
+# Configure le logging
+logger = get_logger('port_scanner')
 
 class PortScanner:
-    def __init__(self, target: str, ports: List[int] = None, threads: int = 100, timeout: float = 1.0):
-        self.target = target
-        self.ports = ports if ports else list(range(1, 1001))  # Ports 1-1000 par défaut
-        self.threads = threads
-        self.timeout = timeout
+    def __init__(self, target: str, ports: List[int] = None, threads: int = None, timeout: float = None):
+        # Valide la cible
+        try:
+            self.target = validate_target(target)
+            logger.info(f"Initialisation du scanner pour: {target} (résolu: {self.target})")
+        except ValidationError as e:
+            logger.error(f"Erreur de validation de la cible: {e}")
+            raise
+        
+        self.ports = ports if ports else SCANNER_CONFIG.get('default_ports', list(range(1, 1001)))
+        self.threads = threads if threads else SCANNER_CONFIG.get('default_threads', 100)
+        self.timeout = timeout if timeout else SCANNER_CONFIG.get('default_timeout', 1.0)
         self.open_ports = []
         self.services = {}
         self.lock = threading.Lock()
@@ -108,13 +84,25 @@ class PortScanner:
                             service_name = 'VNC'
                         elif 'SMB' in banner_upper or 'Samba' in banner_upper:
                             service_name = 'SMB'
+                except socket.timeout:
+                    logger.debug(f"Timeout lors de la récupération du banner pour le port {port}")
+                except socket.error as e:
+                    logger.debug(f"Erreur socket lors de la récupération du banner pour le port {port}: {e}")
+                except UnicodeDecodeError:
+                    logger.debug(f"Erreur de décodage du banner pour le port {port}")
+                finally:
+                    if sock:
+                        sock.close()
+        except socket.error as e:
+            logger.debug(f"Erreur de connexion pour le port {port}: {e}")
+        except Exception as e:
+            logger.warning(f"Erreur inattendue lors de la récupération du banner pour le port {port}: {e}")
+        finally:
+            if sock:
+                try:
+                    sock.close()
                 except:
                     pass
-                
-                sock.close()
-                return service_name, banner
-        except:
-            pass
         
         return service_name, banner
     
@@ -136,13 +124,25 @@ class PortScanner:
                         'banner': banner[:100] if banner else None  # Limite à 100 caractères
                     }
                 
-                sock.close()
+                logger.debug(f"Port {port} ouvert - Service: {service_name}")
                 return True
             else:
-                sock.close()
                 return False
-        except Exception as e:
+        except socket.timeout:
+            logger.debug(f"Timeout lors du scan du port {port}")
             return False
+        except socket.error as e:
+            logger.debug(f"Erreur socket lors du scan du port {port}: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"Erreur inattendue lors du scan du port {port}: {e}")
+            return False
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
     
     def worker(self):
         """Fonction de travail pour les threads"""
@@ -389,18 +389,11 @@ class ReportGenerator:
 
 def parse_ports(port_string: str) -> List[int]:
     """Parse une chaîne de ports (ex: '80,443,8000-8010')"""
-    ports = []
-    parts = port_string.split(',')
-    
-    for part in parts:
-        part = part.strip()
-        if '-' in part:
-            start, end = part.split('-')
-            ports.extend(range(int(start), int(end) + 1))
-        else:
-            ports.append(int(part))
-    
-    return sorted(set(ports))
+    try:
+        return validate_port_range(port_string)
+    except ValidationError as e:
+        logger.error(f"Erreur de validation des ports: {e}")
+        raise
 
 def main():
     parser = argparse.ArgumentParser(
@@ -422,29 +415,56 @@ Exemples d'utilisation:
     parser.add_argument('-o', '--output', type=str, help='Fichier de sortie pour le rapport')
     parser.add_argument('--fast', action='store_true', help='Scan rapide (ports communs seulement)')
     
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       default='INFO', help='Niveau de logging (défaut: INFO)')
+    parser.add_argument('--log-file', type=str, help='Fichier de log (optionnel)')
+    
     args = parser.parse_args()
+    
+    # Configure le logging
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    log_file = args.log_file or LOGGING_CONFIG.get('log_file', '').format(
+        timestamp=datetime.now().strftime('%Y%m%d_%H%M%S')
+    )
+    
+    setup_logger(
+        name='port_scanner',
+        level=log_level,
+        log_file=log_file if LOGGING_CONFIG.get('file', True) else None,
+        log_dir=LOGGING_CONFIG.get('log_dir', 'logs')
+    )
+    
+    logger.info("=" * 70)
+    logger.info("Démarrage du Scanner de Ports & Services Intelligent")
+    logger.info("=" * 70)
+    
+    # Valide la cible
+    try:
+        target_ip = validate_target(args.target)
+        if target_ip != args.target:
+            print(f"{Colors.CYAN}[*] {args.target} résolu en {target_ip}{Colors.RESET}")
+            logger.info(f"Cible résolue: {args.target} -> {target_ip}")
+    except ValidationError as e:
+        logger.error(f"Erreur de validation de la cible: {e}")
+        print(f"{Colors.RED}[!] Erreur: {e}{Colors.RESET}")
+        sys.exit(1)
     
     # Détermine les ports à scanner
     if args.fast:
         ports = list(SERVICES_COMMON.keys())
         print(f"{Colors.YELLOW}[!] Mode rapide: scan des ports communs uniquement{Colors.RESET}\n")
+        logger.info(f"Mode rapide: {len(ports)} ports communs")
     elif args.ports:
         try:
             ports = parse_ports(args.ports)
-        except ValueError:
-            print(f"{Colors.RED}[!] Erreur: Format de ports invalide{Colors.RESET}")
+            logger.info(f"Ports spécifiés: {len(ports)} port(s)")
+        except ValidationError as e:
+            logger.error(f"Erreur de validation des ports: {e}")
+            print(f"{Colors.RED}[!] Erreur: {e}{Colors.RESET}")
             sys.exit(1)
     else:
         ports = None  # Utilisera la valeur par défaut (1-1000)
-    
-    # Résout le nom de domaine si nécessaire
-    try:
-        target_ip = socket.gethostbyname(args.target)
-        if target_ip != args.target:
-            print(f"{Colors.CYAN}[*] {args.target} résolu en {target_ip}{Colors.RESET}")
-    except socket.gaierror:
-        print(f"{Colors.RED}[!] Erreur: Impossible de résoudre {args.target}{Colors.RESET}")
-        sys.exit(1)
+        logger.info("Utilisation des ports par défaut (1-1000)")
     
     # Lance le scan
     scanner = PortScanner(
